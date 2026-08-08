@@ -17,11 +17,11 @@ async function startServer() {
   app.use(express.json());
 
   // Wait for file processing on Gemini
-  async function waitForFileActive(ai: any, fileName: string) {
-    console.log(`Waiting for file ${fileName} to be processed...`);
+  async function waitForFileActive(ai: any, fileName: string, sendUpdate?: (status: string) => void) {
+    if (sendUpdate) sendUpdate('Waiting for video processing to complete...');
     let file = await ai.files.get({ name: fileName });
     while (file.state === 'PROCESSING') {
-      console.log('File is processing, waiting...');
+      if (sendUpdate) sendUpdate('Still processing video on Gemini... This can take a few minutes for large files.');
       await new Promise((resolve) => setTimeout(resolve, 3000));
       file = await ai.files.get({ name: fileName });
     }
@@ -32,10 +32,27 @@ async function startServer() {
   }
 
   app.post('/api/analyze', upload.single('video'), async (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const sendUpdate = (status: string) => {
+      res.write(`data: ${JSON.stringify({ status })}\n\n`);
+    };
+
+    const sendResult = (result: string) => {
+      res.write(`data: ${JSON.stringify({ result })}\n\n`);
+    };
+
+    const sendError = (error: string) => {
+      res.write(`data: ${JSON.stringify({ error })}\n\n`);
+      res.end();
+    };
+
     try {
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
-        return res.status(500).json({ error: 'GEMINI_API_KEY is missing' });
+        return sendError('GEMINI_API_KEY is missing');
       }
 
       const ai = new GoogleGenAI({
@@ -49,7 +66,7 @@ async function startServer() {
       let cleanup = () => {};
 
       if (videoUrl) {
-        console.log(`Downloading video from URL: ${videoUrl}`);
+        sendUpdate('Downloading video from URL...');
         // Handle URL
         const response = await fetch(videoUrl);
         if (!response.ok) {
@@ -66,18 +83,18 @@ async function startServer() {
         }
         cleanup = () => fs.unlink(filePath, () => {});
       } else if (req.file) {
-        console.log(`Using uploaded file: ${req.file.path}`);
+        sendUpdate('Processing uploaded video file...');
         // Handle file upload
         filePath = req.file.path;
         mimeType = req.file.mimetype;
         cleanup = () => fs.unlink(filePath, () => {});
       } else {
-        return res.status(400).json({ error: 'Please provide either a video file or a videoUrl' });
+        return sendError('Please provide either a video file or a videoUrl');
       }
 
       const promptText = prompt || 'Analyze this video and provide a summary of the key information, events, and subjects shown.';
 
-      console.log(`Uploading file ${filePath} with mimeType ${mimeType} to Gemini...`);
+      sendUpdate('Uploading video to Gemini for analysis...');
       // Upload to Gemini
       let uploadedFile = await ai.files.upload({
         file: filePath,
@@ -87,11 +104,10 @@ async function startServer() {
       // Cleanup local file immediately after upload
       cleanup();
 
-      console.log(`Uploaded file as ${uploadedFile.name}. Waiting for it to become ACTIVE.`);
-
       // Wait for it to become ACTIVE
-      uploadedFile = await waitForFileActive(ai, uploadedFile.name!);
-      console.log(`File is ACTIVE. Generating content...`);
+      uploadedFile = await waitForFileActive(ai, uploadedFile.name!, sendUpdate);
+      
+      sendUpdate('Video processing complete. Generating analysis...');
 
       // Analyze with Gemini 3.1 Pro Preview as requested
       const result = await ai.models.generateContent({
@@ -102,13 +118,14 @@ async function startServer() {
         ],
       });
 
-      console.log('Analysis complete.');
+      sendUpdate('Analysis complete.');
       // Return response
-      res.json({ result: result.text });
+      sendResult(result.text);
+      res.end();
 
     } catch (error: any) {
       console.error('Error in /api/analyze:', error);
-      res.status(500).json({ error: error.message || 'An error occurred during analysis.' });
+      sendError(error.message || 'An error occurred during analysis.');
     }
   });
 
